@@ -17,6 +17,8 @@ import ContainersPreview
 import DequeModule
 import Testing
 
+private struct MultiProducerSingleConsumerAsyncChannelTestError: Error {}
+
 @Suite(.serialized)
 struct MultiProducerSingleConsumerAsyncChannelTests {
   // MARK: - AsyncReader.read
@@ -75,7 +77,120 @@ struct MultiProducerSingleConsumerAsyncChannelTests {
 
   @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
   @Test
-  func readReturnsEmptyBufferOnEOSAfterFinish() async throws {
+  func readThrowsCancellationWhenTaskStartsCancelled() async {
+    await withTaskGroup(of: Void.self) { group in
+      group.cancelAll()
+      // A child added to an already-cancelled group starts cancelled, so the
+      // cancellation handler runs before the reader continuation is installed.
+      group.addTask {
+        await MultiProducerSingleConsumerAsyncChannel.withChannel(
+          of: Int.self,
+          backpressureStrategy: .watermark(low: 1, high: 2)
+        ) { channel, source in
+          var channel = channel
+          _ = consume source
+
+          do {
+            _ = try await channel.read { _, _ in
+              Issue.record("read body must not run after cancellation")
+            }
+            Issue.record("expected CancellationError")
+          } catch let EitherError<EitherError<Never, CancellationError>, Never>.first(.second(error)) {
+            _ = error
+          } catch {
+            Issue.record("unexpected error: \(error)")
+          }
+        }
+      }
+      await group.waitForAll()
+    }
+  }
+
+  @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+  @Test
+  func readDoesNotThrowCancellationWhenSourceFinishes() async throws {
+    try await MultiProducerSingleConsumerAsyncChannel.withChannel(
+      of: Int.self,
+      backpressureStrategy: .watermark(low: 1, high: 2)
+    ) { channel, source in
+      var channel = channel
+      let source = source
+      source.finish()
+
+      var sawFinalElement = false
+      try await channel.read { buffer, finalElement in
+        #expect(buffer.count == 0)
+        sawFinalElement = finalElement != nil
+      }
+      #expect(sawFinalElement)
+    }
+  }
+
+  @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+  @Test
+  func readAfterCancellationPreconditions() async {
+    await #expect(processExitsWith: .failure) {
+      await withTaskGroup(of: Void.self) { group in
+        group.cancelAll()
+        group.addTask {
+          await MultiProducerSingleConsumerAsyncChannel.withChannel(
+            of: Int.self,
+            backpressureStrategy: .watermark(low: 1, high: 2)
+          ) { channel, source in
+            var channel = channel
+            _ = consume source
+
+            try? await channel.read { _, _ in }
+            try? await channel.read { _, _ in }
+          }
+        }
+        await group.waitForAll()
+      }
+    }
+  }
+
+  @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+  @Test
+  func readAfterFinalElementPreconditions() async {
+    await #expect(processExitsWith: .failure) {
+      try await MultiProducerSingleConsumerAsyncChannel.withChannel(
+        of: Int.self,
+        backpressureStrategy: .watermark(low: 1, high: 2)
+      ) { channel, source in
+        var channel = channel
+        let source = source
+        source.finish()
+
+        try await channel.read { _, finalElement in
+          #expect(finalElement != nil)
+        }
+        try await channel.read { _, _ in }
+      }
+    }
+  }
+
+  @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+  @Test
+  func readAfterFailurePreconditions() async {
+    await #expect(processExitsWith: .failure) {
+      await MultiProducerSingleConsumerAsyncChannel.withChannel(
+        of: Int.self,
+        throwing: MultiProducerSingleConsumerAsyncChannelTestError.self,
+        backpressureStrategy: .watermark(low: 1, high: 2)
+      ) { channel, source in
+        var channel = channel
+        let source = source
+        source.finish(throwing: MultiProducerSingleConsumerAsyncChannelTestError())
+
+        try? await channel.read { _, _ in }
+        try? await channel.read { _, _ in }
+      }
+    }
+  }
+
+  @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+  @Test
+  func readReturnsEmptyBufferAndFinalElementOnEOSAfterFinish() async throws {
     try await MultiProducerSingleConsumerAsyncChannel.withChannel(
       of: Int.self,
       backpressureStrategy: .watermark(low: 2, high: 4)
@@ -86,17 +201,18 @@ struct MultiProducerSingleConsumerAsyncChannelTests {
       var writeBuffer = UniqueArray<Int>(minimumCapacity: 1)
       writeBuffer.append(1)
       try await source.write(buffer: &writeBuffer)
-      source.finish()
 
-      try await channel.read { buffer, _ in
+      try await channel.read { buffer, finalElement in
         #expect(buffer.count == 1)
+        #expect(finalElement == nil)
         buffer.removeAll()
       }
-      var sawEmpty = false
-      try await channel.read { buffer, _ in
-        sawEmpty = buffer.count == 0
+      source.finish()
+
+      try await channel.read { buffer, finalElement in
+        #expect(buffer.count == 0)
+        #expect(finalElement != nil)
       }
-      #expect(sawEmpty)
     }
   }
 
@@ -426,15 +542,12 @@ struct MultiProducerSingleConsumerAsyncChannelTests {
         var source = source
 
         group.addTask {
-          // Reader drains until EOS.
+          // Reader drains until it observes the final element.
           while true {
             var done = false
-            try await channel.read { buffer, _ in
-              if buffer.count == 0 {
-                done = true
-              } else {
-                buffer.removeAll()
-              }
+            try await channel.read { buffer, finalElement in
+              buffer.removeAll()
+              done = finalElement != nil
             }
             if done { break }
           }
@@ -465,13 +578,10 @@ struct MultiProducerSingleConsumerAsyncChannelTests {
           nonisolated(unsafe) var collected: [Int] = []
           var done = false
           while !done {
-            try await channel.read { buffer, _ in
-              if buffer.count == 0 {
-                done = true
-              } else {
-                var c = buffer.consumeAll()
-                while let v = c.next() { collected.append(v) }
-              }
+            try await channel.read { buffer, finalElement in
+              var c = buffer.consumeAll()
+              while let v = c.next() { collected.append(v) }
+              done = finalElement != nil
             }
           }
           #expect(collected == Array(0..<total))
